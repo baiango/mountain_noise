@@ -5,11 +5,11 @@
 | Noise Type | Image | Kurtosis | Range | Description |
 |---|---|---|---|---|
 | **Mountain noise** | ![mountain](mountain_noise.png) | **+0.174** | 0.07–0.93 | Rare extremes in single pass |
-| FastNoise2 1 oct | ![fn2_1](fn2_1oct.png) | -1.201 | 0.00–1.00 | Flat distribution, common extremes |
-| FastNoise2 2 oct | ![fn2_2](fn2_2oct.png) | -0.806 | 0.00–1.00 | More detail, still flat |
-| FastNoise2 3 oct | ![fn2_3](fn2_3oct.png) | -0.738 | 0.00–1.00 | Fine detail emerging |
-| FastNoise2 4 oct | ![fn2_4](fn2_4oct.png) | -0.724 | 0.00–1.00 | Complex terrain |
-| FastNoise2 6 oct | ![fn2_6](fn2_6oct.png) | -0.719 | 0.00–1.00 | Very detailed, still platykurtic |
+| FastNoise2 1 oct | ![fn2_1](fn2_1oct.png) | -1.210 | 0.00–1.00 | Flat distribution, common extremes |
+| FastNoise2 2 oct | ![fn2_2](fn2_2oct.png) | -0.835 | 0.00–1.00 | More detail, still flat |
+| FastNoise2 3 oct | ![fn2_3](fn2_3oct.png) | -0.769 | 0.00–1.00 | Fine detail emerging |
+| FastNoise2 4 oct | ![fn2_4](fn2_4oct.png) | -0.751 | 0.00–1.00 | Complex terrain |
+| FastNoise2 6 oct | ![fn2_6](fn2_6oct.png) | -0.748 | 0.00–1.00 | Very detailed, still platykurtic |
 
 ## What is it?
 
@@ -108,38 +108,55 @@ t = t⁴
 
 | Implementation | Mp/s | Kurtosis | Notes |
 |---|---|---|---|
-| **Mountain noise (4-gradient)** | **365** | +0.174 | Single pass, rare extremes |
-| FastNoise2 simplex | 363 | -1.1 | Flat distribution |
-| FastNoise2 fBm (3 oct) | ~127 | ~-0.7 | Needs stacking for extremes |
+| **Mountain noise (v10)** | **411** | +0.174 | Single pass, rare extremes |
+| FastNoise2 simplex (1 oct) | 377 | -1.210 | Flat distribution |
+| FastNoise2 fBm (2 oct) | 175 | -0.835 | Needs stacking for extremes |
+| FastNoise2 fBm (3 oct) | 122 | -0.769 | Needs stacking for extremes |
+| FastNoise2 fBm (4 oct) | 94 | -0.751 | Needs stacking for extremes |
 | Ashima simplex | 196 | -1.1 | Original reference |
 
-Mountain noise at 365 Mp/s gives rare extremes in a single pass. FastNoise2 at 363 Mp/s gives flat distribution — you'd need 3-4 octaves of fBm (~100 Mp/s) for the same effect.
+Mountain noise at 411 Mp/s gives rare extremes in a single pass. FastNoise2 simplex at 377 Mp/s gives flat distribution — you'd need 3-4 octaves of fBm (94-122 Mp/s) for the same effect.
 
 ### Optimizations Applied
 
 1. **Algebraic simplification**: `cos = u²/(2π²-u²)`, `sin = v²/(2π²-v²)` — eliminates f², t_c, t_s, both ×4 multiplies
-2. **8-wide interleaving**: processes 8 pixels per iteration, hides `vrecpeq` latency
-3. **4-gradient sharing**: corner 0 shared across both 4-pixel groups, 23% faster
-4. **Fused HASHED_CORNER**: gradient + attenuation fused, reciprocal latency hidden
-5. **2-multiply Murmur hash**: shorter hash chain with fused XORs
-6. **Pre-computed seed**: `seed_vec` computed once outside loop
-7. **Sign extraction CSE**: `h23 = h<<23` once, derive cs and ss from it (3 shifts instead of 4)
-8. **`vbslq` for mask-to-float**: 1 op instead of 2
-9. **Row pointer hoisting**: `float *row = out + py * w`
-10. **`-mcpu=apple-m4`**: target-specific optimization
+2. **16-pixel unrolling**: processes 16 pixels per iteration (2 blocks of 8), hides `vrecpeq` latency
+3. **Sequential block evaluation**: block A fully processed before block B starts — reduces stack spills from 24 to 13
+4. **4-gradient sharing**: corner 0 shared across both 4-pixel groups, 23% faster
+5. **Fused GRADIENT_AND_TWO_CONTRIB**: gradient + attenuation fused for shared corners, reciprocal latency hidden
+6. **2-multiply Murmur hash**: shorter hash chain with fused XORs (`vmulq_n_u32` form)
+7. **Pre-computed seed**: `seed_vec` computed once outside loop
+8. **Sign extraction CSE**: `h23 = h<<23` once, derive cs and ss from it (3 shifts instead of 4)
+9. **Shared iv+jv coordinate transform**: `ij = iv + jv` computed once, used for both x and y
+10. **FMA coordinate transform**: `vfmaq_f32(vsubq_f32(vx, iv), ij, Cx)` — 2 FMAs instead of 4 ops
+11. **Separate accumulators**: gradient contributions computed separately, then accumulated
+12. **Row pointer hoisting**: `float *row = out + py * w`
+13. **`-mcpu=apple-m4 -ffp-contract=fast`**: target-specific optimization with FMA contraction
 
 ### Bottleneck
 
-The `vrecpeq_f32` reciprocal (4 cycles) is the irreducible bottleneck — it's what creates the non-uniform gradient distribution that produces rare extremes. Removing it (unnormalized gradients) gives flat simplex-like noise at 375 Mp/s but loses the mountain noise property.
+The `vrecpeq_f32` reciprocal (4 cycles) is the irreducible bottleneck — it's what creates the non-uniform gradient distribution that produces rare extremes. Removing it (unnormalized gradients) gives flat simplex-like noise but loses the mountain noise property.
+
+### Hardware Counter Analysis (Instruments)
+
+| Metric | P-core | E-core |
+|---|---|---|
+| IPC | 1.40 | 0.81 |
+| Stack spills | 13 stores | — |
+| FP ops/pixel | ~27 | — |
+| Theoretical max | ~520 Mp/s | — |
+| Efficiency | 77% | — |
+
+The code is FP-throughput bound on P-cores (IPC 1.40). E-core migration hurts performance (IPC 0.81 with 14% stall cycles). The theoretical max of ~520 Mp/s assumes 4 FP execution units at 3.5 GHz.
 
 ## Properties
 
 | Property | Mountain Noise | Simplex (Ashima) | FastNoise2 Simplex |
 |---|---|---|---|
-| Distribution | Gaussian (kurt≈+0.17) | Flat (kurt≈-1.1) | Flat (kurt≈-1.1) |
+| Distribution | Gaussian (kurt≈+0.17) | Flat (kurt≈-1.1) | Flat (kurt≈-1.2) |
 | Rare extremes | Yes (natural) | No (needs fBm) | No (needs fBm) |
 | Floor calls | 2 | 14 | ~2 |
-| Speed (C, NEON) | 365 Mp/s | 196 Mp/s | 363 Mp/s |
+| Speed (C, NEON) | 411 Mp/s | 196 Mp/s | 377 Mp/s |
 | Lookup tables | None | None | Yes |
 
 ### Detected Biases
@@ -197,7 +214,7 @@ Mountain noise's 16.9× clustering ratio matches this geological reality — ter
 ## Build & Run
 
 ```sh
-# Apple M4
+# Apple M4 (recommended)
 cc -O3 -mcpu=apple-m4 -ffast-math -ffp-contract=fast -o mountain_noise mountain_noise_neon.c
 
 # Apple M1/M2/M3
@@ -213,7 +230,7 @@ cc -O3 -march=native -ffast-math -o mountain_noise mountain_noise_neon.c
 ## When to use
 
 - **Terrain generation:** Natural Gaussian distribution means rare peaks and valleys without stacking octaves
-- **Real-time applications:** Single-pass noise with rare extremes at 365 Mp/s
+- **Real-time applications:** Single-pass noise with rare extremes at 411 Mp/s
 - **When you want clustered extremes:** Large flat highlands and deep valleys
 
 ## When NOT to use
