@@ -4,7 +4,7 @@
 
 | Noise Type | Image | Kurtosis | Range | Description |
 |---|---|---|---|---|
-| **Mountain noise** | ![mountain](compare_mountain.png) | **+0.145** | 0.08–0.94 | Rare extremes in single pass |
+| **Mountain noise** | ![mountain](mountain_noise.png) | **+0.174** | 0.07–0.93 | Rare extremes in single pass |
 | FastNoise2 1 oct | ![fn2_1](fn2_1oct.png) | -1.201 | 0.00–1.00 | Flat distribution, common extremes |
 | FastNoise2 2 oct | ![fn2_2](fn2_2oct.png) | -0.806 | 0.00–1.00 | More detail, still flat |
 | FastNoise2 3 oct | ![fn2_3](fn2_3oct.png) | -0.738 | 0.00–1.00 | Fine detail emerging |
@@ -28,10 +28,10 @@ Standard simplex (triangular) grid with skew constants:
 2-multiply Murmur hash with pre-computed seed and fused XORs:
 
 ```c
-static inline uint32x4_t hash2d4_short(int32x4_t ix, int32x4_t iy, uint32x4_t seed_vec) {
+static inline uint32x4_t hash2d4(int32x4_t ix, int32x4_t iy, uint32x4_t sv) {
     uint32x4_t h = vreinterpretq_u32_s32(ix);
     h = vmulq_u32(h, vdupq_n_u32(0x9E3779B9u));
-    h = veorq_u32(h, veorq_u32(vreinterpretq_u32_s32(iy), seed_vec));  /* fused XOR */
+    h = veorq_u32(h, veorq_u32(vreinterpretq_u32_s32(iy), sv));
     h = veorq_u32(h, vshrq_n_u32(h, 16));
     h = vmulq_u32(h, vdupq_n_u32(0x85ebca6bu));
     h = veorq_u32(h, vshrq_n_u32(h, 13));
@@ -53,6 +53,40 @@ The algebraic simplification allows computing both cos and sin from the same for
 - `cos = u² / (2π² - u²)` where `u = π - 2f`
 - `sin = v² / (2π² - v²)` where `v = 2f`
 
+### Fused Gradient + Attenuation
+
+The gradient computation is fused with the attenuation (m⁴) calculation to hide `vrecpeq` latency:
+
+```c
+#define HASHED_CORNER(hh, dx, dy, n) do {
+    /* Issue vrecpeq FIRST — 4 cycle latency */
+    float32x4_t _rca = vrecpeq_f32(vsubq_f32(tpi2, _u2));
+    float32x4_t _rsa = vrecpeq_f32(vsubq_f32(tpi2, _v2));
+    /* Independent work while frecpe in flight */
+    float32x4_t _d = vmlaq_f32(vmulq_f32(dx, dx), dy, dy);
+    float32x4_t _m = vmaxq_f32(vsubq_f32(Ch, _d), zero);
+    _m = vmulq_f32(_m, _m); _m = vmulq_f32(_m, _m);
+    /* Consume reciprocal results */
+    float32x4_t _ca = vmulq_f32(_u2, _rca);
+    float32x4_t _sa = vmulq_f32(_v2, _rsa);
+    /* Dot + accumulate */
+    n = vmlaq_f32(n, _m, vmlaq_f32(vmulq_f32(_ca, dx), _sa, dy));
+} while(0)
+```
+
+### 4-Gradient Optimization
+
+The 8-wide loop processes two 4-pixel groups. Sharing one corner's gradient across both groups (4-gradient variant) gives 23% speedup with no visual artifacts:
+
+| Gradients | Speed | Kurtosis | Artifacts |
+|---|---|---|---|
+| 3 | ~435 Mp/s | +0.206 | Yes |
+| **4** | **~365 Mp/s** | **+0.174** | **No** |
+| 5 | ~327 Mp/s | +0.174 | No |
+| 6 | ~296 Mp/s | +0.173 | No |
+
+Sharing more than 1 corner creates visible artifacts at 4-pixel group boundaries.
+
 ### Sign Extraction: CSE Optimization
 
 ```c
@@ -70,25 +104,29 @@ t = t⁴
 
 ## Performance
 
-### Speed Comparison (1024×1024, single-threaded)
+### Speed Comparison (1024×1024, single-threaded, Apple M4)
 
 | Implementation | Mp/s | Kurtosis | Notes |
 |---|---|---|---|
-| **Mountain noise (8-wide)** | **311** | +0.17 | Single pass, rare extremes |
+| **Mountain noise (4-gradient)** | **365** | +0.174 | Single pass, rare extremes |
 | FastNoise2 simplex | 363 | -1.1 | Flat distribution |
 | FastNoise2 fBm (3 oct) | ~127 | ~-0.7 | Needs stacking for extremes |
 | Ashima simplex | 196 | -1.1 | Original reference |
 
-Mountain noise at 311 Mp/s gives rare extremes in a single pass. FastNoise2 at 363 Mp/s gives flat distribution — you'd need 3-4 octaves of fBm (~100 Mp/s) for the same effect.
+Mountain noise at 365 Mp/s gives rare extremes in a single pass. FastNoise2 at 363 Mp/s gives flat distribution — you'd need 3-4 octaves of fBm (~100 Mp/s) for the same effect.
 
 ### Optimizations Applied
 
 1. **Algebraic simplification**: `cos = u²/(2π²-u²)`, `sin = v²/(2π²-v²)` — eliminates f², t_c, t_s, both ×4 multiplies
 2. **8-wide interleaving**: processes 8 pixels per iteration, hides `vrecpeq` latency
-3. **2-multiply Murmur hash**: shorter hash chain with fused XORs
-4. **Pre-computed seed**: `seed_vec` computed once outside loop
-5. **Sign extraction CSE**: `h23 = h<<23` once, derive cs and ss from it (3 shifts instead of 4)
-6. **`vbslq` for mask-to-float**: 1 op instead of 2
+3. **4-gradient sharing**: corner 0 shared across both 4-pixel groups, 23% faster
+4. **Fused HASHED_CORNER**: gradient + attenuation fused, reciprocal latency hidden
+5. **2-multiply Murmur hash**: shorter hash chain with fused XORs
+6. **Pre-computed seed**: `seed_vec` computed once outside loop
+7. **Sign extraction CSE**: `h23 = h<<23` once, derive cs and ss from it (3 shifts instead of 4)
+8. **`vbslq` for mask-to-float**: 1 op instead of 2
+9. **Row pointer hoisting**: `float *row = out + py * w`
+10. **`-mcpu=apple-m4`**: target-specific optimization
 
 ### Bottleneck
 
@@ -101,7 +139,7 @@ The `vrecpeq_f32` reciprocal (4 cycles) is the irreducible bottleneck — it's w
 | Distribution | Gaussian (kurt≈+0.17) | Flat (kurt≈-1.1) | Flat (kurt≈-1.1) |
 | Rare extremes | Yes (natural) | No (needs fBm) | No (needs fBm) |
 | Floor calls | 2 | 14 | ~2 |
-| Speed (C, NEON) | 311 Mp/s | 196 Mp/s | 363 Mp/s |
+| Speed (C, NEON) | 365 Mp/s | 196 Mp/s | 363 Mp/s |
 | Lookup tables | None | None | Yes |
 
 ### Detected Biases
@@ -115,6 +153,12 @@ The `vrecpeq_f32` reciprocal (4 cycles) is the irreducible bottleneck — it's w
 | Spectral isotropy | 0.138 | Frequency content is isotropic |
 
 The axis-aligned bias and spatial clustering are inherent to the formula — they're the same property that creates the rare extremes. You can't have mountain noise without them.
+
+### Gradient Count Analysis
+
+![gradient comparison](gradient_comparison.png)
+
+Sharing too many corners (1g, 2g, 3g) creates artifacts. Sharing just corner 0 (4g) is the sweet spot — 23% faster than 6g with no visual artifacts.
 
 ## Natural Terrain with Clustered Peaks and Troughs
 
@@ -150,10 +194,26 @@ Tectonic forces create **linear features** (mountain chains, rift valleys) not i
 
 Mountain noise's 16.9× clustering ratio matches this geological reality — terrain extremes are rarely isolated, they form connected systems.
 
+## Build & Run
+
+```sh
+# Apple M4
+cc -O3 -mcpu=apple-m4 -ffast-math -ffp-contract=fast -o mountain_noise mountain_noise_neon.c
+
+# Apple M1/M2/M3
+cc -O3 -mcpu=apple-m1 -ffast-math -ffp-contract=fast -o mountain_noise mountain_noise_neon.c
+
+# Generic ARM NEON
+cc -O3 -march=native -ffast-math -o mountain_noise mountain_noise_neon.c
+
+# Generate image
+./mountain_noise 1024 1024 0.04 42 output.pgm
+```
+
 ## When to use
 
 - **Terrain generation:** Natural Gaussian distribution means rare peaks and valleys without stacking octaves
-- **Real-time applications:** Single-pass noise with rare extremes at 311 Mp/s
+- **Real-time applications:** Single-pass noise with rare extremes at 365 Mp/s
 - **When you want clustered extremes:** Large flat highlands and deep valleys
 
 ## When NOT to use
