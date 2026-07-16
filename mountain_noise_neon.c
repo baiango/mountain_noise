@@ -1,5 +1,6 @@
 /* mountain_noise_standalone.c — Standalone peak noise generator
  *
+ * Compile: cc -O3 -march=native -ffast-math -o mountain_noise mountain_noise_neon.c
  * Run:     ./mountain_noise [width] [height] [freq] [seed] [output.pgm]
  */
 #include <arm_neon.h>
